@@ -1,0 +1,226 @@
+====================
+app/__init__.py
+====================
+
+====================
+app/binance_client.py
+====================
+import aiohttp
+
+from app.config import config
+
+
+class BinanceClient:
+
+    def __init__(self):
+        self.session = None
+
+    async def __aenter__(self):
+        timeout = aiohttp.ClientTimeout(total=config.REQUEST_TIMEOUT)
+        self.session = aiohttp.ClientSession(timeout=timeout)
+        return self
+
+    async def __aexit__(self, *args):
+        await self.session.close()
+
+    async def get_symbols(self):
+
+        async with self.session.get(
+            f"{config.BASE_URL}/fapi/v1/exchangeInfo"
+        ) as response:
+
+            data = await response.json()
+
+        return [
+            s["symbol"]
+            for s in data["symbols"]
+            if s["quoteAsset"] == "USDT"
+            and s["status"] == "TRADING"
+        ]
+
+    async def get_klines(self, symbol):
+
+        params = {
+            "symbol": symbol,
+            "interval": config.INTERVAL,
+            "limit": config.LIMIT,
+        }
+
+        async with self.session.get(
+            f"{config.BASE_URL}/fapi/v1/klines",
+            params=params,
+        ) as response:
+
+            return await response.json()
+
+====================
+app/config.py
+====================
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Config:
+    BASE_URL = "https://fapi.binance.com"
+
+    INTERVAL = "1h"
+    LIMIT = 200
+
+    RSI_PERIOD = 14
+    RSI_LEVEL = 30
+
+    REQUEST_TIMEOUT = 15
+
+config = Config()
+
+====================
+app/database.py
+====================
+
+====================
+app/indicators.py
+====================
+import numpy as np
+
+
+def rsi(closes, period=14):
+    closes = np.array(closes, dtype=float)
+
+    if len(closes) < period + 1:
+        return None
+
+    delta = np.diff(closes)
+
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+
+    avg_gain = np.mean(gain[:period])
+    avg_loss = np.mean(loss[:period])
+
+    for i in range(period, len(gain)):
+        avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+
+    return round(100 - (100 / (1 + rs)), 2)
+
+====================
+app/logger.py
+====================
+import logging
+import os
+
+os.makedirs("logs", exist_ok=True)
+
+logger = logging.getLogger("scanner")
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+)
+
+console = logging.StreamHandler()
+console.setFormatter(formatter)
+
+file = logging.FileHandler("logs/bot.log")
+file.setFormatter(formatter)
+
+logger.addHandler(console)
+logger.addHandler(file)
+
+====================
+app/main.py
+====================
+from app.binance_client import BinanceClient
+from app.scanner import Scanner
+
+
+async def main():
+
+    async with BinanceClient() as client:
+
+        scanner = Scanner(client)
+
+        signals = await scanner.scan()
+
+        print()
+
+        print("=" * 60)
+
+        print(f"LONG SIGNALS ({len(signals)})")
+
+        print("=" * 60)
+
+        for symbol, value in signals:
+
+            print(f"{symbol:<18} RSI {value}")
+
+====================
+app/scanner.py
+====================
+import asyncio
+
+from app.indicators import rsi
+
+
+class Scanner:
+
+    def __init__(self, client):
+
+        self.client = client
+
+        self.sem = asyncio.Semaphore(20)
+
+    async def scan_symbol(self, symbol):
+
+        async with self.sem:
+
+            candles = await self.client.get_klines(symbol)
+
+            closes = [float(c[4]) for c in candles]
+
+            value = rsi(closes)
+
+            return symbol, value
+
+    async def scan(self):
+
+        symbols = await self.client.get_symbols()
+
+        tasks = []
+
+        for symbol in symbols:
+            tasks.append(self.scan_symbol(symbol))
+
+        result = await asyncio.gather(
+            *tasks,
+            return_exceptions=True
+        )
+
+        signals = []
+
+        for item in result:
+
+            if isinstance(item, Exception):
+                continue
+
+            symbol, value = item
+
+            if value is None:
+                continue
+
+            if value <= 30:
+                signals.append((symbol, value))
+
+        signals.sort(key=lambda x: x[1])
+
+        return signals
+
+====================
+app/telegram_client.py
+====================
+

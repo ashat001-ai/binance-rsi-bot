@@ -1,42 +1,77 @@
+import asyncio
+
 import aiohttp
+
+from app.config import config
 
 
 class BinanceClient:
-    BASE_URL = "https://fapi.binance.com"
 
-    async def get_exchange_info(self):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self.BASE_URL}/fapi/v1/exchangeInfo") as resp:
-                resp.raise_for_status()
-                return await resp.json()
+    def __init__(self):
+        self.session = None
 
-    async def get_usdt_symbols(self):
-        data = await self.get_exchange_info()
+    async def __aenter__(self):
+        timeout = aiohttp.ClientTimeout(total=config.REQUEST_TIMEOUT)
+        self.session = aiohttp.ClientSession(timeout=timeout)
+        return self
 
-        symbols = [
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.session:
+            await self.session.close()
+
+    async def request(self, endpoint, params=None):
+
+        url = f"{config.BASE_URL}{endpoint}"
+
+        for attempt in range(3):
+
+            try:
+
+                async with self.session.get(url, params=params) as response:
+
+                    response.raise_for_status()
+
+                    return await response.json()
+
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ):
+
+                if attempt == 2:
+                    raise
+
+                await asyncio.sleep(1)
+
+    async def get_symbols(self):
+
+        data = await self.request("/fapi/v1/exchangeInfo")
+
+        return [
             s["symbol"]
             for s in data["symbols"]
-            if s["status"] == "TRADING"
-            and s["quoteAsset"] == "USDT"
+            if s["quoteAsset"] == "USDT"
+            and s["status"] == "TRADING"
         ]
-    async def get_klines(
-        self,
-        symbol: str,
-        interval: str = "1h",
-        limit: int = 200,
-    ):
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{self.BASE_URL}/fapi/v1/klines",
-                params=params,
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.json()
+    async def get_klines(self, symbol):
 
-        return sorted(symbols)
+        return await self.request(
+            "/fapi/v1/klines",
+            {
+                "symbol": symbol,
+                "interval": config.INTERVAL,
+                "limit": config.LIMIT,
+            },
+        )
+
+    async def get_price(self, symbol):
+
+        data = await self.request(
+            "/fapi/v2/ticker/price",
+            {
+                "symbol": symbol,
+            },
+        )
+
+        return float(data["price"])
